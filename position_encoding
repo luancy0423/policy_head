@@ -1,0 +1,174 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+Transformer模型使用的多种位置编码方法
+"""
+import math
+import torch
+from torch import nn
+from policy_heads.util.misc import NestedTensor  # 嵌套张量数据结构
+
+import IPython
+e = IPython.embed  # 调试用嵌入函数
+
+class PositionEmbeddingSine(nn.Module):
+    """正弦位置编码（适用于图像数据）
+    特性:
+        - 基于Attention is All You Need论文的位置编码方法
+        - 生成与输入分辨率自适应的二维位置编码
+        - 支持坐标归一化处理
+    
+    参数:
+        num_pos_feats (int): 每个位置方向（x/y）的编码维度，总维度为num_pos_feats*2
+        temperature (int): 控制频率衰减速度的温度参数
+        normalize (bool): 是否对坐标进行归一化处理
+        scale (float): 归一化时的缩放系数，需与normalize配合使用
+    """
+    def __init__(self, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
+        super().__init__()
+        self.num_pos_feats = num_pos_feats  # 每个方向的编码维度
+        self.temperature = temperature      # 频率调节参数
+        self.normalize = normalize          # 是否归一化坐标
+        if scale is not None and not normalize:
+            raise ValueError("normalize必须为True时scale才生效")
+        self.scale = scale or 2 * math.pi   # 默认缩放系数为2π
+
+    def forward(self, tensor):
+        """生成位置编码
+        输入:
+            tensor: 图像特征张量 [B, C, H, W]
+        返回:
+            pos: 位置编码张量 [B, num_pos_feats*2, H, W]
+        """
+        # 生成坐标掩码（假设所有位置有效）
+        not_mask = torch.ones_like(tensor[0, [0]])  # [1, 1, H, W]
+        
+        # 计算累积坐标（模拟网格坐标）
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)  # 高度方向累积 [1, H, W]
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)  # 宽度方向累积 [1, H, W]
+
+        # 坐标归一化（缩放到0~2π范围）
+        if self.normalize:
+            eps = 1e-6
+            y_embed = (y_embed / (y_embed[:, -1:, :] + eps)) * self.scale  # 高度归一化
+            x_embed = (x_embed / (x_embed[:, :, -1:] + eps)) * self.scale  # 宽度归一化
+
+        # 生成频率序列（指数衰减）
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=tensor.device)
+        dim_t = self.temperature ​** (2 * (dim_t // 2) / self.num_pos_feats)  # [num_pos_feats]
+
+        # 计算位置编码（正弦余弦交替）
+        pos_x = x_embed[:, :, :, None] / dim_t  # [B, H, W, D]
+        pos_y = y_embed[:, :, :, None] / dim_t  # [B, H, W, D]
+        
+        # 交替使用正弦余弦函数
+        pos_x = torch.stack([pos_x[:, :, :, 0::2].sin(),  # 偶数索引用正弦
+                            pos_x[:, :, :, 1::2].cos()], dim=4).flatten(3)  # 拼接后展平
+        pos_y = torch.stack([pos_y[:, :, :, 0::2].sin(),
+                            pos_y[:, :, :, 1::2].cos()], dim=4).flatten(3)
+        
+        # 拼接并调整维度顺序
+        pos = torch.cat([pos_y, pos_x], dim=3)  # [B, H, W, 2D]
+        pos = pos.permute(0, 3, 1, 2)  # [B, 2D, H, W]
+        return pos
+
+
+class PositionEmbeddingLearned(nn.Module):
+    """可学习的位置编码（适用于图像数据）
+    特性:
+        - 通过嵌入层学习位置特征
+        - 支持任意分辨率（通过插值）
+    
+    参数:
+        num_pos_feats (int): 每个方向（行/列）的编码维度，总维度为num_pos_feats*2
+    """
+    def __init__(self, num_pos_feats=256):
+        super().__init__()
+        # 行（高度）和列（宽度）的嵌入层
+        self.row_embed = nn.Embedding(50, num_pos_feats)  # 假设最大高度50
+        self.col_embed = nn.Embedding(50, num_pos_feats)  # 假设最大宽度50
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """参数初始化"""
+        nn.init.uniform_(self.row_embed.weight)  # 均匀分布初始化
+        nn.init.uniform_(self.col_embed.weight)
+
+    def forward(self, tensor_list: NestedTensor):
+        """生成位置编码
+        输入:
+            tensor_list: 包含张量和掩码的嵌套结构
+                - tensors: 图像特征 [B, C, H, W]
+        返回:
+            pos: 位置编码 [B, 2*num_pos_feats, H, W]
+        """
+        x = tensor_list.tensors
+        B, _, H, W = x.shape
+        
+        # 生成行列索引
+        col_ind = torch.arange(W, device=x.device)  # [W]
+        row_ind = torch.arange(H, device=x.device)  # [H]
+        
+        # 获取行列嵌入
+        col_emb = self.col_embed(col_ind)  # [W, D]
+        row_emb = self.row_embed(row_ind)  # [H, D]
+        
+        # 构建二维位置编码
+        pos = torch.cat([
+            col_emb.unsqueeze(0).expand(H, -1, -1),  # [H, W, D]
+            row_emb.unsqueeze(1).expand(-1, W, -1)   # [H, W, D]
+        ], dim=-1)  # [H, W, 2D]
+        
+        # 调整维度并扩展批次
+        pos = pos.permute(2, 0, 1).unsqueeze(0)  # [1, 2D, H, W]
+        pos = pos.expand(B, -1, -1, -1)  # [B, 2D, H, W]
+        return pos
+
+
+def position_encoding_1d(x):
+    """标准一维位置编码（Transformer风格）
+    参数:
+        x: 输入张量 [B, seq_len, d_model]
+    返回:
+        pos_enc: 位置编码 [seq_len, d_model]
+    数学公式:
+        PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    """
+    seq_len, d_model = x.size(1), x.size(2)
+    pos_enc = torch.zeros(seq_len, d_model, dtype=x.dtype, device=x.device)
+    
+    # 生成位置索引
+    position = torch.arange(seq_len, dtype=x.dtype, device=x.device).unsqueeze(1)  # [seq_len, 1]
+    
+    # 计算频率项
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2, dtype=x.dtype, device=x.device) * 
+        (-math.log(10000.0) / d_model)
+    )  # [d_model/2]
+    
+    # 填充正弦余弦项
+    pos_enc[:, 0::2] = torch.sin(position * div_term)  # 偶数维度
+    pos_enc[:, 1::2] = torch.cos(position * div_term)    # 奇数维度
+    
+    return pos_enc  # [seq_len, d_model]
+
+
+def build_position_encoding(args):
+    """位置编码工厂函数
+    参数:
+        args: 配置参数对象，需包含:
+            - hidden_dim: 隐藏层维度
+            - position_embedding: 编码类型（'sine'或'learned'）
+    返回:
+        PositionEmbedding实例
+    """
+    N_steps = args.hidden_dim // 2  # 每个方向编码维度（总维度需*2）
+    
+    if args.position_embedding in ('v2', 'sine'):
+        # 正弦编码（适合需要泛化的场景）
+        return PositionEmbeddingSine(N_steps, normalize=True)
+    elif args.position_embedding in ('v3', 'learned'):
+        # 可学习编码（适合数据充足场景）
+        return PositionEmbeddingLearned(N_steps)
+    else:
+        raise ValueError(f"不支持的编码类型: {args.position_embedding}")
