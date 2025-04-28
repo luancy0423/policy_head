@@ -1,0 +1,214 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+主干网络模块定义
+包含特征提取网络和位置编码的组合实现
+"""
+from collections import OrderedDict
+import torch
+import torch.nn.functional as F
+import torchvision
+from torch import nn
+from torchvision.models._utils import IntermediateLayerGetter  # 用于获取中间层输出的工具
+from typing import Dict, List
+from policy_heads.util.misc import is_main_process, NestedTensor  # 工具函数和数据结构
+from .position_encoding import build_position_encoding  # 位置编码构建函数
+
+import IPython
+e = IPython.embed  # 调试用嵌入函数
+
+class FrozenBatchNorm2d(torch.nn.Module):
+    """冻结的批量归一化层（参数不可训练）
+    特性:
+        - 固定批量统计量（running_mean/running_var）
+        - 固定仿射参数（weight/bias）
+        适用于迁移学习中保持预训练BN参数不变的情况
+    
+    原始实现参考torchvision.ops，增加epsilon防止除零错误
+    
+    Args:
+        n (int): 特征通道数
+    """
+    def __init__(self, n):
+        super(FrozenBatchNorm2d, self).__init__()
+        # 注册缓冲区（不参与训练的参数）
+        self.register_buffer("weight", torch.ones(n))          # 缩放参数
+        self.register_buffer("bias", torch.zeros(n))           # 偏移参数
+        self.register_buffer("running_mean", torch.zeros(n))   # 运行均值
+        self.register_buffer("running_var", torch.ones(n))     # 运行方差
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # 从状态字典中移除num_batches_tracked参数（冻结BN不需要跟踪batch数量）
+        num_batches_tracked_key = prefix + 'num_batches_tracked'
+        if num_batches_tracked_key in state_dict:
+            del state_dict[num_batches_tracked_key]
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
+    def forward(self, x):
+        """前向传播过程
+        Args:
+            x (Tensor): 输入特征图，形状 [B, C, H, W]
+        
+        Returns:
+            Tensor: 归一化后的特征图，形状保持不变
+        数学公式:
+            y = (x - E[x]) / sqrt(Var[x] + ε) * γ + β
+            其中γ=weight，β=bias，E和Var为冻结的统计量
+        """
+        # 将参数重塑为适合广播的维度
+        w = self.weight.reshape(1, -1, 1, 1)        # [1, C, 1, 1]
+        b = self.bias.reshape(1, -1, 1, 1)           # [1, C, 1, 1]
+        rv = self.running_var.reshape(1, -1, 1, 1)   # [1, C, 1, 1]
+        rm = self.running_mean.reshape(1, -1, 1, 1)  # [1, C, 1, 1]
+        
+        eps = 1e-5  # 防止除零的小量
+        scale = w * (rv + eps).rsqrt()  # 计算缩放因子 γ / sqrt(Var + ε)
+        bias = b - rm * scale           # 计算偏移项 β - μ * scale
+        
+        return x * scale + bias  # 应用仿射变换
+
+
+class BackboneBase(nn.Module):
+    """主干网络基类
+    功能:
+        - 通过IntermediateLayerGetter获取指定层的输出
+        - 支持返回中间层或多层特征
+    
+    Args:
+        backbone (nn.Module): 主干网络模型（如ResNet）
+        train_backbone (bool): 是否训练主干网络
+        num_channels (int): 输出特征通道数
+        return_interm_layers (bool): 是否返回中间层特征
+    """
+    def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int, return_interm_layers: bool):
+        super().__init__()
+        # 设置需要返回的层名称映射
+        if return_interm_layers:
+            # 返回ResNet的四个阶段输出（layer1-layer4）
+            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+        else:
+            # 仅返回最后层（layer4）
+            return_layers = {'layer4': "0"}
+        
+        # 使用中间层获取器包装主干网络
+        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+        self.num_channels = num_channels  # 记录输出通道数（用于下游任务）
+
+    def forward(self, tensor):
+        """前向传播
+        Args:
+            tensor (Tensor): 输入图像张量，形状 [B, C, H, W]
+        
+        Returns:
+            OrderedDict: 各层特征图的字典，键为层名称，值为特征图张量
+        """
+        xs = self.body(tensor)  # 获取指定层的输出
+        return xs
+
+
+class Backbone(BackboneBase):
+    """ResNet主干网络实现
+    特性:
+        - 使用FrozenBatchNorm2d
+        - 支持空洞卷积(dilation)
+        - 自动适配不同深度的ResNet变体
+    
+    Args:
+        name (str): ResNet型号名称（如'resnet50'）
+        train_backbone (bool): 是否训练主干网络
+        return_interm_layers (bool): 是否返回中间层特征
+        dilation (bool): 是否在最后一个block使用空洞卷积
+    """
+    def __init__(self, name: str, train_backbone: bool, return_interm_layers: bool, dilation: bool):
+        # 加载预训练ResNet模型并进行修改
+        backbone = getattr(torchvision.models, name)(
+            replace_stride_with_dilation=[False, False, dilation],  # 控制是否替换步长为空洞卷积
+            pretrained=is_main_process(),  # 仅主进程下载预训练权重
+            norm_layer=FrozenBatchNorm2d   # 使用冻结的BN层
+        )
+        
+        # 根据模型深度设置特征通道数
+        if name in ('resnet18', 'resnet34'):
+            num_channels = 512   # 浅层ResNet的最终特征维度
+        else:
+            num_channels = 2048  # ResNet50及更深的模型
+        
+        super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
+
+
+class Joiner(nn.Sequential):
+    """主干网络与位置编码的组合模块
+    功能:
+        - 串联执行主干网络和位置编码
+        - 处理嵌套张量(NestedTensor)输入
+    
+    Args:
+        backbone (Backbone): 主干网络实例
+        position_embedding (nn.Module): 位置编码模块
+    """
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+
+    def forward(self, tensor_list: NestedTensor):
+        """处理嵌套张量输入
+        Args:
+            tensor_list (NestedTensor): 包含tensor和mask的结构
+                - tensor: 图像数据 [B, C, H, W]
+                - mask: 像素有效性掩码 [B, H, W]
+        
+        Returns:
+            tuple: 
+                - out (List[Tensor]): 各层特征图列表
+                - pos (List[Tensor]): 各层位置编码列表
+        """
+        # 通过主干网络获取特征
+        xs = self[0](tensor_list)
+        
+        out = []  # 存储特征图
+        pos = []  # 存储位置编码
+        for name, x in xs.items():
+            out.append(x)
+            # 为每个特征图生成位置编码，保持与特征图相同的数据类型
+            pos.append(self[1](x).to(x.dtype))
+        
+        return out, pos
+
+
+def build_backbone(args):
+    """构建主干网络的工厂函数
+    Args:
+        args (argparse.Namespace): 配置参数，需包含：
+            - backbone (str): 主干网络类型
+            - lr_backbone (float): 主干网络学习率（>0则训练）
+            - masks (bool): 是否返回中间层（用于分割任务）
+            - dilation (bool): 是否使用空洞卷积
+            - position_embedding (str): 位置编码类型
+    
+    Returns:
+        Joiner: 组合后的主干网络和位置编码模块
+    """
+    # 构建位置编码模块
+    position_embedding = build_position_encoding(args)
+    
+    # 判断是否需要训练主干网络
+    train_backbone = args.lr_backbone > 0  # 学习率>0时解冻参数
+    
+    # 是否返回中间层（用于需要多尺度特征的任务如分割）
+    return_interm_layers = args.masks
+    
+    # 实例化ResNet主干
+    backbone = Backbone(
+        args.backbone, 
+        train_backbone, 
+        return_interm_layers, 
+        args.dilation
+    )
+    
+    # 组合主干网络和位置编码
+    model = Joiner(backbone, position_embedding)
+    model.num_channels = backbone.num_channels  # 记录通道数供后续模块使用
+    
+    return model
