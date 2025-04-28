@@ -1,0 +1,439 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+DETR Transformer 实现（基于torch.nn.Transformer修改）
+主要改进:
+    * 在多头注意力中传递位置编码
+    * 移除编码器最后的额外LayerNorm
+    * 解码器返回所有解码层的激活结果
+"""
+import copy
+from typing import Optional, List
+import torch
+import torch.nn.functional as F
+from torch import nn, Tensor
+
+import IPython
+e = IPython.embed  # 交互式调试用嵌入函数
+
+class Transformer(nn.Module):
+    """Transformer主模型（编码器-解码器架构）
+    参数:
+        d_model: 特征维度（默认512）
+        nhead: 多头注意力头数（默认8）
+        num_encoder_layers: 编码器层数（默认6）
+        num_decoder_layers: 解码器层数（默认6）
+        dim_feedforward: 前馈网络隐层维度（默认2048）
+        dropout:  dropout比率（默认0.1）
+        activation: 激活函数类型（"relu"或"gelu"）
+        normalize_before: 是否使用Pre-LN结构（False为Post-LN）
+        return_intermediate_dec: 是否返回所有解码层输出
+    """
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
+                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False,
+                 return_intermediate_dec=False):
+        super().__init__()
+
+        # 编码器构建
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
+
+        # 解码器构建
+        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        decoder_norm = nn.LayerNorm(d_model)
+        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+                                          return_intermediate=return_intermediate_dec)
+
+        self._reset_parameters()  # 参数初始化
+
+        self.d_model = d_model
+        self.nhead = nhead
+
+    def _reset_parameters(self):
+        """Xavier均匀分布初始化参数"""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
+        """前向传播
+        输入:
+            src: 源序列特征（图像特征）[B, C, H, W] 或 [B, HW, C]
+            mask: 序列掩码（未使用）
+            query_embed: 查询嵌入（可学习的位置查询）[num_queries, d_model]
+            pos_embed: 位置编码 [B, d_model, H, W] 或 [B, HW, d_model]
+            latent_input: 潜在变量输入 [B, d_model]
+            proprio_input: 本体感知输入 [B, d_model]
+            additional_pos_embed: 附加位置编码 [2, d_model]
+        返回:
+            hs: 解码器输出 [num_decoder_layers, B, num_queries, d_model]
+        """
+        # 处理图像特征输入（支持4D或3D输入）
+        if len(src.shape) == 4:  # 图像特征为4D张量 [B, C, H, W]
+            bs, c, h, w = src.shape
+            # 展平空间维度 [B, C, H, W] -> [HW, B, C]
+            src = src.flatten(2).permute(2, 0, 1)
+            # 处理位置编码 [B, d_model, H, W] -> [HW, B, d_model]
+            pos_embed = pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)
+            # 扩展查询嵌入 [num_queries, d_model] -> [num_queries, B, d_model]
+            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+            
+            # 拼接附加位置编码 [2, B, d_model] + [HW, B, d_model] -> [2+HW, B, d_model]
+            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
+            
+            # 拼接潜在变量和本体感知输入 [2, B, d_model] + [HW, B, d_model] -> [2+HW, B, d_model]
+            addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            src = torch.cat([addition_input, src], axis=0)
+        else:  # 处理3D输入 [B, HW, C]
+            assert len(src.shape) == 3
+            bs, hw, c = src.shape
+            src = src.permute(1, 0, 2)  # [HW, B, C]
+            
+            # 拼接附加输入
+            addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            src = torch.cat([addition_input, src], axis=0)
+            
+            # 处理位置编码
+            pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            additional_pos_embed = additional_pos_embed.unsqueeze(1).repeat(1, bs, 1)
+            pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
+            
+            # 扩展查询嵌入
+            query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+
+        # 初始化目标序列（全零）
+        tgt = torch.zeros_like(query_embed)
+        
+        # 编码器前向 [seq_len, B, d_model]
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        
+        # 解码器前向 [num_layers, seq_len, B, d_model]
+        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
+                          pos=pos_embed, query_pos=query_embed)
+        # 调整维度顺序 [num_layers, B, num_queries, d_model]
+        hs = hs.transpose(1, 2)
+        return hs
+
+
+class TransformerEncoder(nn.Module):
+    """Transformer编码器堆栈
+    参数:
+        encoder_layer: 编码器层实例
+        num_layers: 堆叠层数
+        norm: 最终层归一化（可选）
+    """
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)  # 深度拷贝层
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src,
+                mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None):
+        """前向传播
+        输入:
+            src: 输入序列 [seq_len, B, d_model]
+            mask: 序列掩码（未使用）
+            src_key_padding_mask: 键填充掩码 [B, seq_len]
+            pos: 位置编码 [seq_len, B, d_model]
+        返回:
+            编码后的序列 [seq_len, B, d_model]
+        """
+        output = src
+        
+        # 逐层处理
+        for layer in self.layers:
+            output = layer(output, src_mask=mask,
+                           src_key_padding_mask=src_key_padding_mask, pos=pos)
+        
+        # 最终层归一化
+        if self.norm is not None:
+            output = self.norm(output)
+        
+        return output
+
+
+class TransformerDecoder(nn.Module):
+    """Transformer解码器堆栈
+    参数:
+        decoder_layer: 解码器层实例
+        num_layers: 堆叠层数
+        norm: 最终层归一化
+        return_intermediate: 是否返回中间层结果
+    """
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        """前向传播
+        输入:
+            tgt: 目标序列（初始为全零） [num_queries, B, d_model]
+            memory: 编码器输出 [seq_len, B, d_model]
+            pos: 位置编码 [seq_len, B, d_model]
+            query_pos: 查询位置编码 [num_queries, B, d_model]
+        返回:
+            解码结果 [num_layers, num_queries, B, d_model]
+        """
+        output = tgt
+        intermediate = []  # 存储中间结果
+        
+        # 逐层处理
+        for layer in self.layers:
+            output = layer(output, memory, tgt_mask=tgt_mask,
+                           memory_mask=memory_mask,
+                           tgt_key_padding_mask=tgt_key_padding_mask,
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos, query_pos=query_pos)
+            if self.return_intermediate:
+                intermediate.append(self.norm(output))
+        
+        # 最终归一化处理
+        if self.norm is not None:
+            output = self.norm(output)
+            if self.return_intermediate:
+                intermediate[-1] = output  # 替换最后一层结果
+        
+        # 堆叠各层输出
+        if self.return_intermediate:
+            return torch.stack(intermediate)
+        
+        return output.unsqueeze(0)
+
+
+class TransformerEncoderLayer(nn.Module):
+    """Transformer编码器层（自注意力机制）
+    结构:
+        Self-Attention -> Add & Norm -> FFN -> Add & Norm
+    参数:
+        d_model: 特征维度
+        nhead: 注意力头数
+        dim_feedforward: 前馈网络隐层维度
+        dropout: dropout比率
+        activation: 激活函数类型
+        normalize_before: 归一化位置（True为Pre-LN，False为Post-LN）
+    """
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # 前馈网络
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        """将位置编码添加到特征"""
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, src,
+                     src_mask: Optional[Tensor] = None,
+                     src_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None):
+        """Post-LN前向流程"""
+        # 自注意力计算（Q=K=特征+位置编码）
+        q = k = self.with_pos_embed(src, pos)
+        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        # 残差连接+归一化
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        # 前馈网络
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        # 残差连接+归一化
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+    def forward_pre(self, src,
+                    src_mask: Optional[Tensor] = None,
+                    src_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None):
+        """Pre-LN前向流程"""
+        # 先归一化
+        src2 = self.norm1(src)
+        # 自注意力计算
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        # 残差连接
+        src = src + self.dropout1(src2)
+        # 前馈网络
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        # 残差连接
+        src = src + self.dropout2(src2)
+        return src
+
+    def forward(self, src,
+                src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None):
+        """前向分发"""
+        if self.normalize_before:
+            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
+        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
+
+
+class TransformerDecoderLayer(nn.Module):
+    """Transformer解码器层（自注意力+交叉注意力）
+    结构:
+        Self-Attention -> Add & Norm -> Cross-Attention -> Add & Norm -> FFN -> Add & Norm
+    参数: 同编码器层
+    """
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # 前馈网络
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_post(self, tgt, memory,
+                     tgt_mask: Optional[Tensor] = None,
+                     memory_mask: Optional[Tensor] = None,
+                     tgt_key_padding_mask: Optional[Tensor] = None,
+                     memory_key_padding_mask: Optional[Tensor] = None,
+                     pos: Optional[Tensor] = None,
+                     query_pos: Optional[Tensor] = None):
+        """Post-LN前向流程"""
+        # 自注意力（Q=K=目标+查询位置编码）
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        
+        # 交叉注意力（Q=目标+查询位置，K=编码器输出+位置编码）
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask
+        )[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        
+        # 前馈网络
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def forward_pre(self, tgt, memory,
+                    tgt_mask: Optional[Tensor] = None,
+                    memory_mask: Optional[Tensor] = None,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None):
+        """Pre-LN前向流程"""
+        # 自注意力（先归一化）
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        
+        # 交叉注意力（先归一化）
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(
+            query=self.with_pos_embed(tgt2, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask
+        )[0]
+        tgt = tgt + self.dropout2(tgt2)
+        
+        # 前馈网络（先归一化）
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+    def forward(self, tgt, memory,
+                tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        """前向分发"""
+        if self.normalize_before:
+            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+
+
+def _get_clones(module, N):
+    """克隆模块N次（深度拷贝）"""
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+def build_transformer(args):
+    """Transformer构建工厂函数
+    参数:
+        args: 配置参数，需包含:
+            hidden_dim: 隐层维度
+            dropout: dropout比率
+            nheads: 注意力头数
+            dim_feedforward: 前馈网络维度
+            enc_layers: 编码器层数
+            dec_layers: 解码器层数
+            pre_norm: 是否使用Pre-LN
+    """
+    return Transformer(
+        d_model=args.hidden_dim,
+        dropout=args.dropout,
+        nhead=args.nheads,
+        dim_feedforward=args.dim_feedforward,
+        num_encoder_layers=args.enc_layers,
+        num_decoder_layers=args.dec_layers,
+        normalize_before=args.pre_norm,
+        return_intermediate_dec=True,
+    )
+
+def _get_activation_fn(activation):
+    """激活函数选择器"""
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    if activation == "glu":
+        return F.glu
+    raise RuntimeError(f"不支持的激活函数: {activation}")
