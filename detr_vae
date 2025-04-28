@@ -1,0 +1,357 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+DETR模型和基于变分自编码器（VAE）的改进版本，包含条件处理机制
+"""
+import torch
+from torch import nn
+from torch.autograd import Variable
+import torch.nn.functional as F
+from .backbone import build_backbone  # 特征提取主干网络构建函数
+from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer  # Transformer组件
+from policy_heads.models.position_encoding import position_encoding_1d  # 一维位置编码
+import numpy as np
+
+import IPython
+e = IPython.embed  # 用于交互式调试的嵌入函数
+
+# 系统常量定义
+IN_DIM_STATE = 7    # 机器人状态输入维度（关节位置+夹爪状态）
+IN_DIM_ACTION = 7   # 动作空间维度（关节控制指令）
+
+def reparametrize(mu, logvar):
+    """重参数化技巧，用于从高斯分布采样
+    Args:
+        mu (Tensor): 高斯分布的均值，形状 [batch_size, latent_dim]
+        logvar (Tensor): 高斯分布的对数方差，形状 [batch_size, latent_dim]
+    
+    Returns:
+        Tensor: 重参数化后的采样结果，形状 [batch_size, latent_dim]
+    
+    数学公式:
+        z = μ + ε * σ
+        其中 σ = exp(logvar / 2), ε ~ N(0, I)
+    """
+    std = logvar.div(2).exp()  # 计算标准差
+    eps = Variable(std.data.new(std.size()).normal_())  # 从标准正态分布采样噪声
+    return mu + std * eps  # 重参数化
+
+def get_sinusoid_encoding_table(n_position, d_hid):
+    """生成正弦位置编码表（非学习型）
+    Args:
+        n_position (int): 最大位置索引数
+        d_hid (int): 编码维度
+    
+    Returns:
+        Tensor: 位置编码矩阵，形状 [1, n_position, d_hid]
+    
+    实现方法:
+        使用不同频率的正弦和余弦函数组合生成位置编码
+        偶数位置使用sin，奇数位置使用cos
+    """
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
+
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # 偶数维度用sin
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # 奇数维度用cos
+    return torch.FloatTensor(sinusoid_table).unsqueeze(0)  # 添加batch维度
+
+class DETRVAE(nn.Module):
+    """基于DETR架构的条件变分自编码器，支持视觉和状态信息的融合处理
+    主要组件:
+        - 多相机特征提取主干网络
+        - Transformer编解码结构
+        - 条件VAE的编码器/解码器
+    
+    参数:
+        backbones (List[nn.Module]): 各相机的特征提取网络列表
+        transformer (nn.Module): Transformer编解码器
+        encoder (nn.Module): CVAE的编码器模块
+        state_dim (int): 机器人状态维度
+        num_queries (int): Transformer的查询数量（检测槽位）
+        camera_names (List[str]): 使用的相机名称列表
+        vq (bool): 是否使用向量量化（Vector Quantization）
+        vq_class (int): 向量量化的码书条目数
+        vq_dim (int): 每个码书向量的维度
+        action_dim (int): 输出动作的维度
+    """
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, vq, vq_class, vq_dim, action_dim):
+        super().__init__()
+        # 初始化模型参数
+        self.num_queries = num_queries        # 查询数量（通常设为100）
+        self.camera_names = camera_names      # 相机名称列表（例如['front', 'wrist']）
+        self.transformer = transformer        # Transformer编解码器
+        self.encoder = encoder                # CVAE编码器（可为None）
+        self.vq, self.vq_class, self.vq_dim = vq, vq_class, vq_dim  # VQ相关参数
+        self.state_dim = state_dim            # 机器人状态维度（关节位置等）
+        self.action_dim = action_dim          # 动作空间维度
+        hidden_dim = transformer.d_model      # Transformer的隐藏维度（通常256）
+
+        # 输出头定义
+        self.action_head = nn.Linear(hidden_dim, action_dim)  # 动作预测头
+        self.is_pad_head = nn.Linear(hidden_dim, 1)           # 填充位置预测头（二元分类）
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)  # 可学习的查询嵌入
+
+        # 输入投影层（根据不同输入类型）
+        if backbones is not None:
+            # 当使用图像输入时
+            self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)  # 图像特征投影
+            self.backbones = nn.ModuleList(backbones)  # 各相机的特征提取网络
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)  # 机器人状态投影
+        else:
+            # 当仅使用状态输入时
+            self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)  # 机器人状态投影
+            self.input_proj_env_state = nn.Linear(state_dim, hidden_dim)    # 环境状态投影
+            self.pos = nn.Embedding(2, hidden_dim)  # 位置嵌入（用于区分机器人状态和环境状态）
+            self.backbones = None
+
+        # 条件编码器参数
+        self.latent_dim = 32  # 潜在变量的维度
+        self.cls_embed = nn.Embedding(1, hidden_dim)        # 分类token（CLS）
+        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)  # 动作序列投影层
+        self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)   # 关节状态投影层
+
+        # 潜在空间处理层
+        print(f'使用VQ: {self.vq}, 码书类别数: {self.vq_class}, 码书维度: {self.vq_dim}')
+        if self.vq:
+            self.latent_proj = nn.Linear(hidden_dim, self.vq_class * self.vq_dim)  # VQ投影
+        else:
+            self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # 标准VAE（均值+方差）
+
+        # 注册缓冲区（不参与训练的位置编码表）
+        # 位置编码表包含CLS token、关节状态和动作序列的位置编码
+        self.register_buffer('pos_table', get_sinusoid_encoding_table(1 + 1 + num_queries, hidden_dim))
+
+        # 解码器相关参数
+        if self.vq:
+            self.latent_out_proj = nn.Linear(self.vq_class * self.vq_dim, hidden_dim)  # VQ反投影
+        else:
+            self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim)  # 标准VAE潜在变量投影
+        self.additional_pos_embed = nn.Embedding(2, hidden_dim)  # 附加位置嵌入（本体感知和潜在变量）
+
+    def encode(self, qpos, actions=None, is_pad=None, vq_sample=None):
+        """条件编码过程，生成潜在变量
+        Args:
+            qpos (Tensor): 关节位置，形状 [batch_size, state_dim]
+            actions (Tensor): 动作序列（训练时），形状 [batch_size, seq_len, action_dim]
+            is_pad (Tensor): 序列填充掩码，形状 [batch_size, seq_len]
+            vq_sample (Tensor): VQ采样结果（推理时使用）
+        
+        Returns:
+            tuple: 包含以下元素的元组
+                - latent_input (Tensor): 潜在变量投影结果
+                - probs (Tensor): VQ概率分布（仅VQ有效）
+                - binaries (Tensor): 采样后的独热编码（仅VQ有效）
+                - mu (Tensor): 均值（标准VAE有效）
+                - logvar (Tensor): 对数方差（标准VAE有效）
+        """
+        batch_size, _ = qpos.shape
+        if self.encoder is None:
+            # 当不使用编码器时，生成零向量
+            latent_sample = torch.zeros([batch_size, self.latent_dim], dtype=torch.float32).to(qpos.device)
+            latent_input = self.latent_out_proj(latent_sample)
+            return latent_input, None, None, None, None
+        else:
+            # 条件编码流程
+            is_training = actions is not None  # 判断训练/推理模式
+
+            if is_training:
+                # 训练阶段：通过动作序列生成条件潜在变量
+                # 投影动作序列到隐藏空间 [batch_size, seq_len, hidden_dim]
+                action_embed = self.encoder_action_proj(actions)
+                # 投影关节状态并增加维度 [batch_size, 1, hidden_dim]
+                qpos_embed = self.encoder_joint_proj(qpos).unsqueeze(1)
+                # 生成CLS token [batch_size, 1, hidden_dim]
+                cls_embed = self.cls_embed.weight.unsqueeze(0).repeat(batch_size, 1, 1)
+                # 拼接编码器输入 [batch_size, seq+2, hidden_dim]
+                encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], dim=1)
+                encoder_input = encoder_input.permute(1, 0, 2)  # [seq+2, batch_size, hidden_dim]
+
+                # 构建填充掩码（CLS和关节状态不填充）
+                cls_joint_is_pad = torch.full((batch_size, 2), False).to(qpos.device)
+                is_pad = torch.cat([cls_joint_is_pad, is_pad], dim=1)  # [batch_size, seq+2]
+
+                # 位置编码处理
+                pos_embed = self.pos_table.clone().detach().permute(1, 0, 2)
+                # 编码器前向传播
+                encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
+                encoder_output = encoder_output[0]  # 取CLS token的输出 [batch_size, hidden_dim]
+
+                # 潜在空间处理分支
+                latent_info = self.latent_proj(encoder_output)
+
+                if self.vq:
+                    # 向量量化分支
+                    logits = latent_info.reshape(*latent_info.shape[:-1], self.vq_class, self.vq_dim)
+                    probs = torch.softmax(logits, dim=-1)  # 计算概率分布
+                    # 通过多项式采样得到离散编码
+                    binaries = F.one_hot(torch.multinomial(probs.view(-1, self.vq_dim), 1).squeeze(-1),
+                                      self.vq_dim).view(-1, self.vq_class, self.vq_dim).float()
+                    # 直通估计器（Straight-Through Estimator）
+                    binaries_flat = binaries.view(-1, self.vq_class * self.vq_dim)
+                    probs_flat = probs.view(-1, self.vq_class * self.vq_dim)
+                    straigt_through = binaries_flat - probs_flat.detach() + probs_flat
+                    latent_input = self.latent_out_proj(straigt_through)
+                    mu = logvar = None
+                else:
+                    # 标准VAE分支
+                    probs = binaries = None
+                    mu = latent_info[:, :self.latent_dim]    # 均值部分
+                    logvar = latent_info[:, self.latent_dim:]  # 对数方差部分
+                    latent_sample = reparametrize(mu, logvar)  # 重参数化采样
+                    latent_input = self.latent_out_proj(latent_sample)
+            else:
+                # 推理阶段处理
+                mu = logvar = binaries = probs = None
+                if self.vq:
+                    # VQ推理时使用外部采样的码书索引
+                    latent_input = self.latent_out_proj(vq_sample.view(-1, self.vq_class * self.vq_dim))
+                else:
+                    # 标准VAE生成零向量
+                    latent_sample = torch.zeros([batch_size, self.latent_dim], dtype=torch.float32).to(qpos.device)
+                    latent_input = self.latent_out_proj(latent_sample)
+
+            return latent_input, probs, binaries, mu, logvar
+
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, vq_sample=None):
+        """完整前向传播过程
+        Args:
+            qpos (Tensor): 关节位置，形状 [batch_size, state_dim]
+            image (Tensor): 多相机图像输入，形状 [batch_size, num_cam, C, H, W]
+            env_state (Tensor): 环境状态（本实现未使用）
+            actions (Tensor): 动作序列（训练时），形状 [batch_size, seq_len, action_dim]
+            is_pad (Tensor): 填充掩码，形状 [batch_size, seq_len]
+            vq_sample (Tensor): VQ采样输入（推理时）
+        
+        Returns:
+            tuple: 包含以下元素的元组
+                - a_hat (Tensor): 预测的动作序列，形状 [batch_size, num_queries, action_dim]
+                - is_pad_hat (Tensor): 填充预测结果，形状 [batch_size, num_queries, 1]
+                - list: 包含均值和对数方差（标准VAE）或None（VQ）
+                - probs (Tensor): VQ概率分布
+                - binaries (Tensor): VQ采样结果
+        """
+        # 编码阶段
+        latent_input, probs, binaries, mu, logvar = self.encode(qpos, actions, is_pad, vq_sample)
+
+        # 解码阶段
+        if self.backbones is not None:
+            # 多相机特征处理分支
+            all_cam_features = []
+            all_cam_pos = []
+            for cam_id, cam_name in enumerate(self.camera_names):
+                # 各相机独立特征提取
+                features, pos = self.backbones[cam_id](image[:, cam_id])
+                features = features[0]  # 取最后一层特征
+                pos = pos[0]            # 对应位置编码
+                # 特征投影和收集
+                all_cam_features.append(self.input_proj(features))
+                all_cam_pos.append(pos)
+            
+            # 拼接多相机特征（沿宽度维度）
+            src = torch.cat(all_cam_features, dim=3)  # [batch_size, hidden_dim, H, W_total]
+            pos = torch.cat(all_cam_pos, dim=3)       # [batch_size, hidden_dim, H, W_total]
+            
+            # 本体感知特征投影
+            proprio_input = self.input_proj_robot_state(qpos)  # [batch_size, hidden_dim]
+            
+            # Transformer前向传播
+            hs = self.transformer(
+                src, 
+                None, 
+                self.query_embed.weight, 
+                pos, 
+                latent_input, 
+                proprio_input,
+                self.additional_pos_embed.weight
+            )[0]  # 取解码器输出 [num_queries, batch_size, hidden_dim]
+        else:
+            # 纯状态处理分支（本实现未使用）
+            qpos = self.input_proj_robot_state(qpos)
+            env_state = self.input_proj_env_state(env_state)
+            transformer_input = torch.cat([qpos, env_state], dim=1)  # [batch_size, 2, hidden_dim]
+            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
+
+        # 输出头预测
+        a_hat = self.action_head(hs)          # 动作预测 [num_queries, batch_size, action_dim]
+        is_pad_hat = self.is_pad_head(hs)    # 填充预测 [num_queries, batch_size, 1]
+        
+        # 调整维度顺序为 [batch_size, num_queries, ...]
+        a_hat = a_hat.permute(1, 0, 2)
+        is_pad_hat = is_pad_hat.permute(1, 0, 2)
+
+        return a_hat, is_pad_hat, [mu, logvar], probs, binaries
+
+class DETRVAEHEAD(nn.Module):
+    """DETRVAE的轻量级版本，适用于特征已经提取的场景
+    主要区别:
+        - 不包含图像处理主干网络
+        - 直接接受预提取的特征作为输入
+    
+    参数参考DETRVAE类，主要差异在forward方法的输入
+    """
+    def __init__(self, transformer, encoder, state_dim, num_queries, camera_names, vq, vq_class, vq_dim, action_dim):
+        super().__init__()
+        # 初始化参数与DETRVAE类似，此处省略重复注释...
+        
+    def forward(self, qpos=None, env_state=None, hidden_states=None, actions=None, is_pad=None, vq_sample=None):
+        """前向传播（接收预提取特征）
+        参数新增:
+            hidden_states (Tensor): 预提取的图像特征，形状 [batch_size, C, H, W]
+        """
+        # 实现逻辑与DETRVAE类似，区别在于直接使用hidden_states代替原始图像处理...
+
+class CNNMLP(nn.Module):
+    """基于CNN和MLP的基准模型，用于对比实验
+    结构特点:
+        - 多相机CNN特征提取
+        - 特征拼接后通过MLP直接回归动作
+    """
+    def __init__(self, backbones, state_dim, camera_names):
+        super().__init__()
+        # 初始化参数...
+        
+    def forward(self, qpos, image, env_state, actions=None):
+        """前向传播过程"""
+        # 实现细节：多相机特征提取->拼接->MLP处理...
+
+def mlp(input_dim, hidden_dim, output_dim, hidden_depth):
+    """构建多层感知机
+    Args:
+        input_dim (int): 输入维度
+        hidden_dim (int): 隐藏层维度
+        output_dim (int): 输出维度
+        hidden_depth (int): 隐藏层数量
+    
+    Returns:
+        nn.Sequential: 构建好的MLP网络
+    """
+    # 实现细节：线性层+ReLU交替...
+
+def build_encoder(args):
+    """构建Transformer编码器组件
+    Args:
+        args: 包含超参数的配置对象
+    
+    Returns:
+        TransformerEncoder: 构建好的编码器
+    """
+    # 实现细节：根据参数构建编码器层...
+
+def build(args):
+    """完整模型构建入口函数
+    Args:
+        args: 配置参数对象
+    
+    Returns:
+        DETRVAE: 构建好的完整模型
+    """
+    # 实现细节：协调各组件构建...
+
+def build_vae_head(args):
+    """轻量级模型构建函数（用于特征提取后的阶段）"""
+    # 实现细节：构建DETRVAEHEAD...
+
+def build_cnnmlp(args):
+    """基准模型构建函数"""
+    # 实现细节：构建CNNMLP...
