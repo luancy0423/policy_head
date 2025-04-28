@@ -1,0 +1,293 @@
+"""
+Diffusion Policy 实现 https://diffusion-policy.cs.columbia.edu/ 作者：程驰
+"""
+from typing import Callable, Union
+import math
+from collections import OrderedDict, deque
+from packaging.version import parse as parse_version
+import random
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+# 需要 diffusers==0.11.1
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.training_utils import EMAModel
+
+
+# =================== 扩散模型用UNet ==============
+
+class SinusoidalPosEmb(nn.Module):
+    """正弦位置编码（用于扩散过程的时间步嵌入）
+    
+    参数:
+        dim: 嵌入维度
+        dtype: 计算使用的数据类型
+    """
+    def __init__(self, dim, dtype):
+        super().__init__()
+        self.dim = dim
+        self.dtype = dtype
+
+    def forward(self, x):
+        """前向传播生成位置编码
+        输入:
+            x: 时间步张量 [batch_size]
+        返回:
+            emb: 位置编码 [batch_size, dim]
+        
+        数学公式:
+            通过不同频率的正弦/余弦函数组合生成位置编码
+        """
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)  # 频率计算基
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=self.dtype) * -emb)  # 生成频率序列
+        emb = x[:, None] * emb[None, :]  # 外积生成位置-频率矩阵
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)  # 拼接正弦余弦部分
+        return emb
+
+
+class Downsample1d(nn.Module):
+    """1D下采样层（步长2卷积）
+    
+    参数:
+        dim: 输入输出通道数
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)  # 核大小3，步长2，padding1
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Upsample1d(nn.Module):
+    """1D上采样层（转置卷积）
+    
+    参数:
+        dim: 输入输出通道数
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)  # 核大小4，步长2，padding1
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class Conv1dBlock(nn.Module):
+    """1D卷积块（Conv1D + GroupNorm + Mish激活）
+    
+    参数:
+        inp_channels: 输入通道数
+        out_channels: 输出通道数
+        kernel_size: 卷积核尺寸
+        n_groups: GroupNorm的分组数
+    """
+    def __init__(self, inp_channels, out_channels, kernel_size, n_groups=8):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size//2),
+            nn.GroupNorm(n_groups, out_channels),  # 分组归一化
+            nn.Mish()  # Mish激活函数，相比ReLU更平滑
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ConditionalResidualBlock1D(nn.Module):
+    """带FiLM调制的条件残差块
+    
+    参数:
+        in_channels: 输入通道数
+        out_channels: 输出通道数
+        cond_dim: 条件向量维度
+        kernel_size: 卷积核尺寸
+        n_groups: GroupNorm的分组数
+    
+    实现说明:
+        1. 使用两个卷积块处理输入特征
+        2. 通过条件编码生成FiLM参数（scale和bias）
+        3. 应用FiLM调制后进行残差连接
+    """
+    def __init__(self, in_channels, out_channels, cond_dim, kernel_size=3, n_groups=8):
+        super().__init__()
+        # 定义两个卷积块
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups),
+        ])
+
+        # FiLM参数生成器（将条件映射为通道级的scale和bias）
+        cond_channels = out_channels * 2  # 每个通道需要两个参数（scale和bias）
+        self.out_channels = out_channels
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(cond_dim, cond_channels),  # 将条件向量投影到所需维度
+            nn.Unflatten(-1, (-1, 1))  # 重塑为 [B, 2*C, 1]
+        )
+
+        # 残差连接处理（当输入输出通道数不同时使用1x1卷积调整）
+        self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
+            if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, cond):
+        """前向传播
+        输入:
+            x: 输入特征 [B, in_channels, T]
+            cond: 条件向量 [B, cond_dim]
+        返回:
+            out: 输出特征 [B, out_channels, T]
+        """
+        out = self.blocks[0](x)  # 第一个卷积块
+        embed = self.cond_encoder(cond)  # 生成FiLM参数 [B, 2*C, 1]
+
+        # 将参数拆分为scale和bias [B, C, 1]
+        embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
+        scale = embed[:, 0, ...]  # [B, C, 1]
+        bias = embed[:, 1, ...]   # [B, C, 1]
+
+        out = scale * out + bias  # FiLM调制
+        out = self.blocks[1](out)  # 第二个卷积块
+        out += self.residual_conv(x)  # 残差连接
+        return out
+
+
+class ConditionalUnet1D(nn.Module):
+    """条件UNet1D（用于扩散模型的动作预测）
+    
+    参数:
+        input_dim: 输入动作维度
+        global_cond_dim: 全局条件维度（如观测特征）
+        diffusion_step_embed_dim: 扩散时间步的嵌入维度
+        down_dims: 下采样各层通道数列表
+        kernel_size: 卷积核尺寸
+        n_groups: GroupNorm的分组数
+        state_dim: 状态输入维度
+    
+    网络结构:
+        - 包含下采样、中间层、上采样三个部分
+        - 使用扩散时间步编码和全局条件融合
+        - 采用跳跃连接保持细节信息
+    """
+    def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256,
+                 down_dims=[256, 512, 1024], kernel_size=5, n_groups=8, state_dim=7):
+        super().__init__()
+        all_dims = [input_dim] + list(down_dims)  # 各层通道数 [输入, 下采样1, 下采样2...]
+        start_dim = down_dims[0]
+
+        # 全局条件处理模块
+        self.global_1d_pool = nn.AdaptiveAvgPool1d(1)  # 全局平均池化
+        self.norm_after_pool = nn.LayerNorm(global_cond_dim)  # 层归一化
+        self.combine = nn.Linear(global_cond_dim + state_dim, global_cond_dim)  # 融合状态和全局条件
+
+        # 扩散时间步编码器
+        dsed = diffusion_step_embed_dim
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(dsed, torch.bfloat16),  # 正弦位置编码
+            nn.Linear(dsed, dsed * 4),  # 全连接扩展
+            nn.Mish(),
+            nn.Linear(dsed * 4, dsed),  # 投影到目标维度
+        )
+        cond_dim = dsed + global_cond_dim  # 总条件维度（时间步 + 全局条件）
+
+        # 中间层模块（两个残差块）
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups),
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups),
+        ])
+
+        # 下采样模块（每个阶段包含两个残差块和一个下采样）
+        down_modules = nn.ModuleList()
+        for ind, (dim_in, dim_out) in enumerate(zip(all_dims[:-1], all_dims[1:])):
+            is_last = ind >= (len(all_dims) - 2)
+            down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(dim_in, dim_out, cond_dim, kernel_size, n_groups),
+                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim, kernel_size, n_groups),
+                Downsample1d(dim_out) if not is_last else nn.Identity()  # 最后一层不下采样
+            ]))
+
+        # 上采样模块（每个阶段包含两个残差块和一个上采样）
+        up_modules = nn.ModuleList()
+        for ind, (dim_in, dim_out) in enumerate(reversed(list(zip(all_dims[:-1], all_dims[1:])))):
+            is_last = ind >= (len(all_dims) - 2)
+            up_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(dim_out*2, dim_in, cond_dim, kernel_size, n_groups),
+                ConditionalResidualBlock1D(dim_in, dim_in, cond_dim, kernel_size, n_groups),
+                Upsample1d(dim_in) if not is_last else nn.Identity()  # 最后一层不上采样
+            ]))
+
+        # 最终输出层
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size),
+            nn.Conv1d(start_dim, input_dim, 1),  # 1x1卷积调整输出维度
+        )
+
+        self.up_modules = up_modules
+        self.down_modules = down_modules
+
+        print("参数量: {:.2e}".format(sum(p.numel() for p in self.parameters())))
+
+    def forward(self, sample, timestep, global_cond=None, states=None):
+        """前向传播
+        输入:
+            sample: 输入动作 [B, T, input_dim]
+            timestep: 扩散时间步 [B] 或标量
+            global_cond: 全局条件 [B, T, global_cond_dim]
+            states: 状态信息 [B, state_dim]
+        返回:
+            预测的噪声 [B, T, input_dim]
+        """
+        # 调整输入维度顺序 [B, input_dim, T]
+        sample = sample.moveaxis(-1, -2)
+        
+        # 处理全局条件
+        if global_cond is not None:
+            global_cond = self.global_1d_pool(global_cond.permute(0,2,1)).squeeze(-1)  # [B, global_cond_dim]
+            global_cond = self.norm_after_pool(global_cond)  # 层归一化
+            if states is not None:
+                global_cond = torch.cat([global_cond, states], dim=-1)  # 拼接状态信息
+            global_cond = self.combine(global_cond)  # 融合后的全局条件 [B, global_cond_dim]
+
+        # 处理时间步输入
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        timestep = timestep.expand(sample.shape[0])  # 扩展到批量维度 [B]
+
+        # 生成扩散时间步特征
+        time_feature = self.diffusion_step_encoder(timestep)  # [B, dsed]
+
+        # 融合时间步和全局条件
+        if global_cond is not None:
+            cond_feature = torch.cat([time_feature, global_cond], dim=-1)  # [B, dsed+global_cond_dim]
+        else:
+            cond_feature = time_feature
+
+        x = sample
+        skips = []
+        
+        # 下采样过程
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, cond_feature)  # 第一个残差块
+            x = resnet2(x, cond_feature)  # 第二个残差块
+            skips.append(x)  # 保存跳跃连接
+            x = downsample(x)  # 下采样
+
+        # 中间处理
+        for mid_module in self.mid_modules:
+            x = mid_module(x, cond_feature)
+
+        # 上采样过程
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat([x, skips.pop()], dim=1)  # 拼接跳跃连接
+            x = resnet(x, cond_feature)  # 第一个残差块
+            x = resnet2(x, cond_feature)  # 第二个残差块
+            x = upsample(x)  # 上采样
+
+        # 最终输出处理
+        x = self.final_conv(x)  # [B, input_dim, T]
+        x = x.moveaxis(-1, -2)  # [B, T, input_dim]
+        return x
